@@ -6,3 +6,4 @@ sudo ./mkra
 ./mkra
 file mkra
 ./mkra -url https://example.com
+v 1.0.1
